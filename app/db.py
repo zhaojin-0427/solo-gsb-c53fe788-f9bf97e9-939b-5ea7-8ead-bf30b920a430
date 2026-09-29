@@ -99,11 +99,25 @@ async def lock_new_or_existing_object(
     """Writer path: create the object row if needed, then FOR UPDATE it.
 
     The upsert guarantees two concurrent first-publishers serialise on
-    the same primary-key row instead of colliding on INSERT; the loser
-    waits and then sees the winner's committed current revision.
+    the same primary-key row instead of colliding on INSERT.  The lock
+    is taken on the ``objects`` row itself (not on a join), so a
+    placeholder row left by session creation -- whose ``current_id`` is
+    NULL -- is locked too; a concurrent acknowledgement then waits
+    until this transaction commits instead of both sides inserting
+    revision 1.
+
+    The revision is read in a *separate* statement: under READ
+    COMMITTED a blocking ``SELECT ... FOR UPDATE`` can return the
+    pre-wait version of the row, so the lock statement's output must
+    not be trusted for the revision identity.  With the objects row
+    already locked, this read is stable until commit.
     """
     await conn.execute(
         "INSERT INTO objects (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+        path,
+    )
+    await conn.execute(
+        "SELECT path FROM objects WHERE path = $1 FOR UPDATE",
         path,
     )
     row = await conn.fetchrow(
@@ -113,7 +127,6 @@ async def lock_new_or_existing_object(
           FROM objects o
           JOIN revisions r ON r.id = o.current_id
          WHERE o.path = $1
-         FOR UPDATE OF o
         """,
         path,
     )
@@ -621,28 +634,45 @@ async def apply_copy_entries(
     The caller decides: commit everything, or roll back and report the
     conflicts — never a partial application.
     """
+    # Lock every target object row in ascending path order BEFORE reading
+    # any revision, including placeholder rows whose current_id is still
+    # NULL: the LEFT JOIN below would otherwise drop them and take no
+    # lock, so a concurrent first-publish (PUT) could slip past the
+    # baseline check and both sides would insert revision 1.  The same
+    # global order is used by session creation (FOR SHARE) and PUT
+    # (FOR UPDATE on a single row), so concurrent batches serialise
+    # without deadlocks.
+    target_paths = sorted({e.target_path for e in entries})
+    await conn.executemany(
+        "INSERT INTO objects (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+        [(p,) for p in target_paths],
+    )
+    await conn.execute(
+        """
+        SELECT o.path
+          FROM objects o
+         WHERE o.path = ANY($1::text[])
+         ORDER BY o.path ASC
+         FOR UPDATE OF o
+        """,
+        target_paths,
+    )
+
     applied: list[dict] = []
     conflicts: list[dict] = []
     for entry in sorted(entries, key=lambda e: e.target_path):
         baseline = baselines[entry.target_path]
-        # Upsert first so concurrent creators serialise on the same row.
-        await conn.execute(
-            "INSERT INTO objects (path) VALUES ($1)"
-            " ON CONFLICT (path) DO NOTHING",
-            entry.target_path,
-        )
         row = await conn.fetchrow(
             """
             SELECT r.id, r.revision_no, r.sha256
               FROM objects o
-              JOIN revisions r ON r.id = o.current_id
+              LEFT JOIN revisions r ON r.id = o.current_id
              WHERE o.path = $1
-             FOR UPDATE OF o
             """,
             entry.target_path,
         )
 
-        if row is None:
+        if row is None or row["id"] is None:
             if baseline.revision_id is None:
                 # Baseline said "absent" and it still is: copy pinned rev 1.
                 new_id = await conn.fetchval(

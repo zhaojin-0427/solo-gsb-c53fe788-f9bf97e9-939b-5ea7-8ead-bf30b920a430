@@ -95,13 +95,17 @@ curl -i -H 'Range: bytes=0-4' -H "If-Range: $ETAG"   http://localhost:8000/objec
    作为查询参数取下一段。每段包含条目内容（base64）、每条目的 SHA-256、段摘要与标识本段的游标。
    重复拉取同一段返回**完全相同的字节、摘要和游标**。
 3. **逐段确认**：`POST /copy-sessions/{id}/acks`，请求体 `{"cursor": "<该段游标>"}`。服务将该分段
-   对应的修订**作为一次原子批次**应用到目标前缀（目标路径 = `target_prefix + source_path`），并按
-   目标路径升序 `FOR UPDATE` 锁定后**与建档基线比较修订身份**：
-   基线不存在且目标仍不存在则创建修订；基线身份未变且摘要相同则幂等跳过；
-   **基线之后目标路径只要发生过发布就是冲突——即使发布的字节与待复制内容完全相同**
+   对应的修订**作为一次原子批次**应用到目标前缀（目标路径 = `target_prefix + source_path`）。
+   确认事务先按目标路径升序对**所有目标对象行（包括建档时留下的、`current_id` 为 NULL 的空占位行）**
+   一次性加 `FOR UPDATE` 锁，再在锁内逐条读取当前修订并与建档基线比较修订身份——
+   占位行若不锁定，并发的首次发布会从内连接的缝隙中漏过，双方都可能插入修订号 1（确认方得到 500 而非冲突）。
+   加锁后：**基线不存在且目标仍不存在则创建修订；基线身份未变且摘要相同则幂等跳过；
+   基线之后目标路径只要发生过发布就是冲突——即使发布的字节与待复制内容完全相同**
    （仅凭摘要无法区分"未改动"与"同字节重新发布"，这是漏判的来源）。
    任一冲突则整批回滚，返回 `409` 及结构化结果（冲突对象、`reason`、期望/实际/基线摘要与修订号、
    恢复位置），不留部分应用、不推进游标。批次结果持久化，**重复确认或重放返回同一批次结果**。
+   与 `PUT` 并发时：`PUT` 先发布则确认返回 `409`（冲突对象 + 恢复位置，整批回滚、游标不前进）；
+   确认先锁住则 `PUT` 等待，确认提交后 `PUT` 读到当前修订并**接续下一个修订号**（不会撞修订号 1）。
 4. **恢复**：确认严格按段序进行；游标过期 / 乱序确认返回 `409 cursor_expired` 与恢复位置。
    冲突解决后（例如用条件 `PUT` 修正目标），用结构化结果里的 `resume.last_confirmed_cursor`
    创建新会话即可从上次确认处继续，新会话基于**新的快照与基线**。
@@ -180,6 +184,70 @@ curl -s -X POST http://localhost:8000/copy-sessions -H 'Content-Type: applicatio
        "cursor": "<last_confirmed_cursor>"}' | python3 -m json.tool
 ```
 
+## 并发验证：确认与首次发布（PUT）交错
+
+会话建档时目标不存在会留下 `current_id` 为 NULL 的占位行。若确认事务用内连接读修订再 `FOR UPDATE`，
+占位行会被丢弃、等于没锁，并发的首次发布就会从缝隙中漏过——双方都插入修订号 1，确认方得到 `500` 而非冲突。
+修复后确认事务先按路径升序锁死**包括空占位在内**的目标对象行，再在锁内读修订、比基线。
+下面的脚本并发地对同一目标路径发起 `PUT` 与确认，可反复运行以覆盖两种交错次序：
+
+```bash
+# 先启动服务（见上）：docker compose up --build
+python3 - <<'PY'
+import concurrent.futures, json, urllib.request, urllib.error
+
+BASE = "http://localhost:8000"
+
+def req(method, path, body=None, ctype=None):
+    data = body if isinstance(body, bytes) else (body.encode() if body is not None else None)
+    headers = {"Content-Type": ctype} if ctype else {}
+    r = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(r) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+# 源对象；建档时目标尚不存在 -> 占位行
+req("PUT", "/objects/race-src.txt", b"source-bytes", "text/plain")
+st, _, body = req("POST", "/copy-sessions",
+                  json.dumps({"source_paths": ["race-src.txt"],
+                              "target_prefix": "race-backup/",
+                              "segment_size": 1}), "application/json")
+sid = json.loads(body)["session"]
+st, _, body = req("GET", f"/copy-sessions/{sid}/segments")
+cursor = json.loads(body)["cursor"]
+target = "/objects/race-backup/race-src.txt"
+
+def do_put():
+    return req("PUT", target, b"put-bytes", "text/plain")
+def do_ack():
+    return req("POST", f"/copy-sessions/{sid}/acks",
+                json.dumps({"cursor": cursor}), "application/json")
+
+# 并发：PUT 与确认同时抢同一把锁
+with concurrent.futures.ThreadPoolExecutor(2) as ex:
+    f_put, f_ack = ex.submit(do_put), ex.submit(do_ack)
+    put_st, put_h, _ = f_put.result()
+    ack_st, _, ack_body = f_ack.result()
+
+print("PUT:", put_st, "X-Revision-No:", put_h.get("x-revision-no"))
+print("ACK:", ack_st, json.loads(ack_body).get("status"))
+
+# 不变量：PUT 必成功（等待后续订号继续）；确认必为 applied 或 conflict，绝不能 500
+assert put_st == 204, "PUT must wait then continue with the next revision number"
+assert ack_st in (200, 409), "ACK must be applied or conflict, never 500"
+cur_st, _, cur_body = req("GET", target)
+print("current target:", cur_st, cur_body)  # 确认先时为 put-bytes(rev2)，PUT 先时为 put-bytes(rev1)
+PY
+```
+
+- **PUT 先发布**：确认返回 `409`（`status=conflict`，含冲突对象、`reason`、实际修订号与恢复位置），
+  整批回滚、`resume.next_segment` 仍为 0、游标不推进；`PUT` 为 `204`、`X-Revision-No: 1`。
+- **确认先锁住**：`PUT` 等待确认事务提交后继续，返回 `204`、`X-Revision-No: 2`（接续的下一个修订号，
+  不与确认方撞修订号 1）；确认为 `200`、`applied[0].action=created`。
+- 无论哪种次序，都**不会出现 `500`**，且目标对象的修订号连续、无重复的修订号 1。
+
 ## 本地开发
 
 ```bash
@@ -198,16 +266,16 @@ python -m pytest
 - `tests/test_etags.py` / `test_preconditions.py` / `test_ranges.py`：纯逻辑单元测试（ETag 强弱比较、§13.2.2 求值顺序、范围解析与合并、边界确定性）。
 - `tests/test_copy_cursor.py`：复制游标与清单摘要的纯逻辑单元测试（编解码往返、防篡改、确定性）。
 - `tests/test_integration.py`：真实 PostgreSQL + 完整 HTTP 服务的端到端测试，覆盖 200/204/206/304/404/412/416、多段 multipart 确定性、`If-Range`、并发"仅创建"只有一个成功、以及流式传输期间发布新版本不混入内容。
-- `tests/test_copy_sessions.py`：复制会话端到端测试，覆盖清单顺序与摘要、分段重复拉取字节一致、源对象发布新修订后仍返回快照内容、原子应用、冲突整批回滚与结构化结果、**建档后同字节重新发布仍判冲突（含已存在目标的同内容新修订、整批回滚、新会话恢复）**、升级前无基线会话返回 `baseline_missing` 不按摘要放行、重放返回同一批次结果、乱序/伪造游标拒绝、跨会话断点续传与冲突恢复、并发确认收敛。
+- `tests/test_copy_sessions.py`：复制会话端到端测试，覆盖清单顺序与摘要、分段重复拉取字节一致、源对象发布新修订后仍返回快照内容、原子应用、冲突整批回滚与结构化结果、**建档后同字节重新发布仍判冲突（含已存在目标的同内容新修订、整批回滚、新会话恢复）**、升级前无基线会话返回 `baseline_missing` 不按摘要放行、重放返回同一批次结果、乱序/伪造游标拒绝、跨会话断点续传与冲突恢复、并发确认收敛、**确认与首次发布（PUT）交错（PUT 先发布返回 409 不推进游标；确认先锁住 PUT 等待并接续修订号；高并发下绝无 500）**。
 
 ## 设计要点
 
 - **数据模型**：`objects(path, current_id)` 指向 `revisions(id, object_path, revision_no, content bytea, sha256, media_type, created_at)`；`created_at` 默认 `date_trunc('second', now())`，保证秒级 `Last-Modified`。
-- **事务与锁**：GET/HEAD 在事务内 `SELECT ... FOR SHARE` 锁定对象行并读取当前修订，流式响应在事务提交前持续持有锁；PUT 先 `INSERT ... ON CONFLICT DO NOTHING` 再 `FOR UPDATE`，并发发布串行执行，前置条件在锁内求值，因此"检查-然后-写"不会交错。
+- **事务与锁**：GET/HEAD 在事务内 `SELECT ... FOR SHARE` 锁定对象行并读取当前修订，流式响应在事务提交前持续持有锁；PUT 先 `INSERT ... ON CONFLICT DO NOTHING` 再对 `objects` 行本身 `FOR UPDATE`（不经过内连接，因此 `current_id` 为 NULL 的占位行也会被锁住），并发发布串行执行，前置条件在锁内求值，因此"检查-然后-写"不会交错。锁定后用**独立的一条语句**读取当前修订——READ COMMITTED 下阻塞的 `SELECT ... FOR UPDATE` 可能返回等待前的旧版本，锁语句的连接输出不可信；锁已持有，该读取到提交都稳定。
 - **流式隔离**：响应体由 `StreamingResponse` 从被锁定的修订分块读出（`substring(content ...)`），事务在最后一个字节发送后才提交，新修订的发布会等待锁释放，故响应内容、ETag、`Content-Range` 始终属于同一修订。
 - **确定性 multipart**：边界 = `SHA-256(ETag | media-type | 升序合并后的区间)`，不含任何随机因素。
 - **复制会话快照**：`copy_sessions` + `copy_session_entries` 在创建事务内先对源集与全部目标路径（先 `INSERT ... ON CONFLICT DO NOTHING` 补齐占位行）按全局路径升序 `FOR SHARE` 锁定，再在锁内读取源修订；清单钉住 `revision_id`（修订行永不更新/删除），因此分段内容在会话生命周期内不可变。
 - **目标修订基线**：建档时在同一锁快照中把每个目标路径的当前修订身份写入 `copy_session_target_baselines`，目标不存在记 NULL。确认时以修订 `id`（而非摘要）判定是否变更：摘要相同只能证明字节相同，不能区分"自基线未改动"与"基线后又发布了同字节修订"，后者必须报冲突。占位行保证"目标不存在"这一基线也被行锁覆盖，并发首发布会阻塞到建档事务提交。
 - **确定性游标**：游标 = HMAC-SHA-256 签名的 `(会话, 段号, 清单摘要, 段末路径, 目标前缀, 源集摘要)`，是同一会话状态的纯函数——重发必相同、跨会话/跨清单必失效（`cursor_expired`）；签名密钥存于 `service_meta` 表，重启后游标仍有效。
-- **原子批次确认**：确认在单事务内按目标路径升序取 `FOR UPDATE` 锁（与建档的 `FOR SHARE`、并发发布及其它会话使用同一全局锁序，无死锁地串行化），逐目标与基线比较修订身份：基线不存在且仍不存在则创建、身份未变且摘要相同则幂等跳过、身份变化（含同字节重发，`reason=target_republished_same_content`）或摘要分歧（`content_diverged`）记为冲突；整批应用 + ack 记录 + 进度推进同事务提交，冲突则整批回滚后单独落库冲突结果。批次结果以**文本**形式存储（保持原始键序），重放与首次响应字节一致；`INSERT ... ON CONFLICT DO NOTHING` 使并发确认收敛到同一条结果。
+- **原子批次确认**：确认在单事务内**先按目标路径升序对所有目标对象行（含 `current_id` 为 NULL 的空占位行）一次性取 `FOR UPDATE` 锁**（与建档的 `FOR SHARE`、并发发布及其它会话使用同一全局锁序，无死锁地串行化；占位行若不锁，并发首发布会从内连接缝隙漏过、双方都插入修订号 1），再在锁内逐条读取当前修订并与基线比较修订身份：基线不存在且仍不存在则创建、身份未变且摘要相同则幂等跳过、身份变化（含同字节重发，`reason=target_republished_same_content`）或摘要分歧（`content_diverged`）记为冲突；整批应用 + ack 记录 + 进度推进同事务提交，冲突则整批回滚后单独落库冲突结果。批次结果以**文本**形式存储（保持原始键序），重放与首次响应字节一致；`INSERT ... ON CONFLICT DO NOTHING` 使并发确认收敛到同一条结果。
 - **升级兼容**：表结构由启动时的 `CREATE TABLE IF NOT EXISTS` 自动补齐，旧库重启即有基线表；升级前创建的未完成会话没有基线行，确认未完成段时返回 `409 baseline_missing` 且不推进游标（绝不按摘要放行），重新创建会话取得新基线后继续；已经持久化的历史确认结果仍优先重放，不受影响。

@@ -464,6 +464,246 @@ def test_concurrent_acks_of_same_segment_converge(client):
     assert client.get(f"/objects/backup/{prefix}/a.txt").content == b"a"
 
 
+# ---- race: acknowledgement vs first publish (PUT) on a placeholder ---------
+
+async def _raw_publish(dsn: str, path: str, content: bytes) -> None:
+    """Simulate a PUT that published rev 1 and committed (separate tx)."""
+    import asyncpg
+
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute(
+            "INSERT INTO objects (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+            path,
+        )
+        await conn.execute(
+            "INSERT INTO revisions"
+            "    (object_path, revision_no, content, sha256, media_type)"
+            " VALUES ($1, 1, $2, $3, 'application/octet-stream')",
+            path,
+            content,
+            hashlib.sha256(content).hexdigest(),
+        )
+        await conn.execute(
+            "UPDATE objects SET current_id = ("
+            "  SELECT id FROM revisions"
+            "   WHERE object_path = $1 AND revision_no = 1"
+            ") WHERE path = $1",
+            path,
+        )
+    finally:
+        await conn.close()
+
+
+async def _count_lock_waits(dsn: str) -> int:
+    """How many other sessions are currently blocked on a row lock."""
+    import asyncpg
+
+    conn = await asyncpg.connect(dsn)
+    try:
+        return await conn.fetchval(
+            "SELECT count(*) FROM pg_stat_activity"
+            " WHERE pid <> pg_backend_pid()"
+            "   AND wait_event_type = 'Lock'"
+        )
+    finally:
+        await conn.close()
+
+
+def test_ack_put_race_put_first_is_conflict(client):
+    """A PUT that published rev 1 before the ack must surface as a 409
+    conflict (not a 500), with the conflict object and resume position,
+    the whole batch rolled back and the cursor not advanced."""
+    import asyncio
+    import os
+
+    prefix = _prefix("race-putfirst")
+    source = f"{prefix}/src.txt"
+    target = f"backup/{prefix}/src.txt"
+    _put_sources(client, prefix, {"src.txt": b"source-bytes"})
+    sid = _create_session(client, [source], "backup/", segment_size=1).json()[
+        "session"
+    ]
+    cursor = _pull(client, sid).json()["cursor"]
+
+    # The target did not exist at session creation (placeholder row).
+    assert client.get(f"/objects/{target}").status_code == 404
+
+    # Simulate a concurrent PUT that published rev 1 and committed first.
+    asyncio.run(_raw_publish(os.environ["DATABASE_URL"], target, b"source-bytes"))
+
+    r = _ack(client, sid, cursor)
+    assert r.status_code == 409, r.text
+    result = r.json()
+    assert result["status"] == "conflict"
+    assert result["applied"] == []
+    assert len(result["conflicts"]) == 1
+    conflict = result["conflicts"][0]
+    assert conflict["target_path"] == target
+    assert conflict["reason"] == "target_republished_same_content"
+    assert conflict["actual_revision_no"] == 1
+    assert conflict["baseline_revision_no"] is None
+    # Resume position points back at this segment; cursor not advanced.
+    assert result["resume"]["next_segment"] == 0
+    assert result["resume"]["last_confirmed_cursor"] is None
+    desc = client.get(f"/copy-sessions/{sid}").json()
+    assert desc["status"] == "open"
+    assert desc["next_segment"] == 0
+
+    # The target holds the PUT's revision; the ack applied nothing.
+    assert client.get(f"/objects/{target}").content == b"source-bytes"
+    # Replay returns the identical stored conflict result.
+    assert _ack(client, sid, cursor).content == r.content
+
+
+def test_ack_put_race_ack_first_put_waits_and_continues(client):
+    """When the ack locks the placeholder first, a concurrent PUT must
+    wait for the ack's transaction to commit and then continue with the
+    next revision number (rev 2), not collide on rev 1."""
+    import asyncio
+    import os
+    import threading
+    import time
+
+    import asyncpg
+
+    prefix = _prefix("race-ackfirst")
+    source = f"{prefix}/src.txt"
+    target = f"backup/{prefix}/src.txt"
+    _put_sources(client, prefix, {"src.txt": b"source-bytes"})
+    sid = _create_session(client, [source], "backup/", segment_size=1).json()[
+        "session"
+    ]
+    cursor = _pull(client, sid).json()["cursor"]
+    dsn = os.environ["DATABASE_URL"]
+
+    # Hold the placeholder's FOR UPDATE lock from a side session: this
+    # serialises the ack and the PUT exactly as a contended lock would,
+    # but keeps the ordering deterministic.  The connection lives on a
+    # persistent event loop so it can be released after the threads
+    # queue up.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        async def hold_lock():
+            conn = await asyncpg.connect(dsn)
+            tr = conn.transaction()
+            await tr.start()
+            await conn.execute(
+                "SELECT path FROM objects WHERE path = $1 FOR UPDATE", target
+            )
+            return conn, tr
+
+        holder_conn, holder_tr = loop.run_until_complete(hold_lock())
+
+        ack_result = {}
+        put_result = {}
+
+        def do_ack():
+            r = _ack(client, sid, cursor)
+            ack_result["status"] = r.status_code
+            ack_result["body"] = r.json()
+
+        def do_put():
+            r = client.put(
+                f"/objects/{target}",
+                content=b"put-bytes",
+                headers={"Content-Type": "text/plain"},
+            )
+            put_result["status"] = r.status_code
+            put_result["revision_no"] = r.headers.get("x-revision-no")
+
+        # Start the ack first: it queues on the placeholder lock.
+        t_ack = threading.Thread(target=do_ack)
+        t_ack.start()
+        deadline = time.monotonic() + 10
+        while loop.run_until_complete(_count_lock_waits(dsn)) < 1:
+            assert time.monotonic() < deadline, "ack did not block on the lock"
+            time.sleep(0.02)
+
+        # Now the PUT queues behind the ack on the same lock.
+        t_put = threading.Thread(target=do_put)
+        t_put.start()
+        deadline = time.monotonic() + 10
+        while loop.run_until_complete(_count_lock_waits(dsn)) < 2:
+            assert time.monotonic() < deadline, "PUT did not queue behind the ack"
+            time.sleep(0.02)
+
+        # Release the holder: the ack proceeds, then the PUT.
+        async def release():
+            await holder_tr.commit()
+            await holder_conn.close()
+
+        loop.run_until_complete(release())
+        t_ack.join(timeout=15)
+        t_put.join(timeout=15)
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+    # The ack applied its pinned rev 1 (source content).
+    assert ack_result["status"] == 200, ack_result
+    assert ack_result["body"]["status"] == "applied"
+    assert ack_result["body"]["applied"][0]["action"] == "created"
+    assert ack_result["body"]["applied"][0]["revision_no"] == 1
+    # The PUT waited and then continued with the next revision number.
+    assert put_result["status"] == 204, put_result
+    assert put_result["revision_no"] == "2"
+    # The current revision is the PUT's rev 2.
+    assert client.get(f"/objects/{target}").content == b"put-bytes"
+    # The session advanced past the confirmed segment.
+    desc = client.get(f"/copy-sessions/{sid}").json()
+    assert desc["status"] == "complete"
+
+
+def test_ack_put_race_stress_no_500(client):
+    """Concurrent acks and first-publishes on the same placeholder must
+    never produce a 500: each outcome is a well-formed 200/204/409."""
+    import threading
+
+    prefix = _prefix("race-stress")
+    source = f"{prefix}/src.txt"
+    target = f"backup/{prefix}/src.txt"
+    _put_sources(client, prefix, {"src.txt": b"source-bytes"})
+    sid = _create_session(client, [source], "backup/", segment_size=1).json()[
+        "session"
+    ]
+    cursor = _pull(client, sid).json()["cursor"]
+
+    outcomes = []
+
+    def do_ack():
+        r = _ack(client, sid, cursor)
+        outcomes.append(("ack", r.status_code))
+
+    def do_put(i):
+        r = client.put(
+            f"/objects/{target}",
+            content=f"put-{i}".encode(),
+            headers={"Content-Type": "text/plain"},
+        )
+        outcomes.append(("put", r.status_code))
+
+    threads = []
+    for i in range(6):
+        threads.append(threading.Thread(target=do_ack if i % 2 == 0 else lambda i=i: do_put(i)))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # No 500s; acks are 200 or 409, PUTs are 204.
+    assert all(code in (200, 409) for kind, code in outcomes if kind == "ack")
+    assert all(code == 204 for kind, code in outcomes if kind == "put")
+    assert all(code != 500 for _, code in outcomes)
+    # Exactly one ack applied (the first to acquire the lock); replays
+    # converge to the same stored result.
+    ack_bodies = {
+        _ack(client, sid, cursor).content for _ in range(3)
+    }
+    assert len(ack_bodies) == 1
+
+
 # ---- resume across sessions ------------------------------------------------------
 
 def test_resume_with_last_confirmed_cursor(client):
