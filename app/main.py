@@ -301,7 +301,10 @@ async def publish_object(path: str, request: Request):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # FOR UPDATE: serialise concurrent publishers on this path.
+            # Lock the object row first (empty placeholder rows included),
+            # then evaluate conditions against the current revision: this
+            # serialises concurrent publishers AND copy-session applies on
+            # the same row without ever inserting a revision before locking.
             rev = await database.lock_new_or_existing_object(conn, path)
             conditions = _conditions_from_request("PUT", request)
             outcome = evaluate(conditions, _selected(rev))
@@ -724,8 +727,19 @@ async def ack_copy_segment(session_id: str, request: Request):
         tx = conn.transaction()
         await tx.start()
         try:
+            # Lock EVERY target object row in ascending path order first --
+            # including the current_id-NULL placeholders left for targets
+            # that did not exist at session creation -- and only then read
+            # the current revisions.  An inner join on revisions would skip
+            # an empty placeholder and lock nothing, letting a concurrent
+            # first PUT race the apply (both inserting revision 1, or a 500
+            # instead of a conflict).  Whichever transaction takes the lock
+            # first wins; the loser wakes up and sees the committed state.
+            current = await database.lock_target_objects(
+                conn, sorted({e.target_path for e in entries})
+            )
             applied, conflicts = await database.apply_copy_entries(
-                conn, entries, baselines
+                conn, entries, baselines, current
             )
         except Exception:
             await tx.rollback()

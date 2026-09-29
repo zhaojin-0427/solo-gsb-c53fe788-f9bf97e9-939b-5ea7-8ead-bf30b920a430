@@ -464,6 +464,247 @@ def test_concurrent_acks_of_same_segment_converge(client):
     assert client.get(f"/objects/backup/{prefix}/a.txt").content == b"a"
 
 
+# ---- acknowledgement vs a concurrent first publish to a placeholder -------------
+
+
+def _open_session_for_missing_target(client, body=b"same-bytes"):
+    """Create + pull a session whose target exists only as a NULL placeholder."""
+    import asyncio
+    import asyncpg
+    import os
+
+    prefix = _prefix("race-empty")
+    paths = _put_sources(client, prefix, {"a.txt": body})
+    sid = _create_session(client, paths, "backup/", segment_size=1).json()["session"]
+    cursor = _pull(client, sid).json()["cursor"]
+    target = f"backup/{prefix}/a.txt"
+
+    # Session creation leaves an empty placeholder object row; verify it.
+    async def placeholder_is_empty():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            current_id = await conn.fetchval(
+                "SELECT current_id FROM objects WHERE path = $1", target
+            )
+            return current_id
+        finally:
+            await conn.close()
+
+    assert asyncio.run(placeholder_is_empty()) is None
+    return sid, cursor, target
+
+
+def test_ack_after_uncommitted_first_put_reports_conflict_not_500(client):
+    """Deterministic PUT-first interleave: the PUT publishes rev 1 but has
+    not committed when the acknowledgement locks the target.  The ack must
+    block on the *placeholder row* (not miss it), wake up to the committed
+    revision and return the structured 409 -- never a 500, never a second
+    revision 1."""
+    import asyncio
+    import asyncpg
+    import os
+
+    from app import db
+
+    sid, cursor, target = _open_session_for_missing_target(client)
+
+    async def scenario():
+        conn_put = await asyncpg.connect(os.environ["DATABASE_URL"])
+        conn_ack = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            # PUT goes first: lock placeholder + insert rev 1, hold open.
+            t_put = conn_put.transaction()
+            await t_put.start()
+            rev = await db.lock_new_or_existing_object(conn_put, target)
+            assert rev is None  # empty placeholder
+            await db.publish_revision(conn_put, target, b"same-bytes", "text/plain")
+
+            # ACK interleaves before the PUT commits.
+            t_ack = conn_ack.transaction()
+            await t_ack.start()
+            entries = await db.fetch_segment_entries(conn_ack, sid, 0)
+            baselines = await db.fetch_segment_baselines(conn_ack, sid, 0)
+
+            async def apply():
+                current = await db.lock_target_objects(conn_ack, [target])
+                return await db.apply_copy_entries(
+                    conn_ack, entries, baselines, current
+                )
+
+            apply_task = asyncio.create_task(apply())
+            await asyncio.sleep(1.0)
+            # The ack is queued on the placeholder row lock, not erroring.
+            assert not apply_task.done()
+            await t_put.commit()  # PUT lands first
+            applied, conflicts = await asyncio.wait_for(apply_task, timeout=10)
+            await t_ack.rollback()  # conflict responses never apply anything
+
+            assert applied == []
+            assert len(conflicts) == 1
+            conflict = conflicts[0]
+            assert conflict["target_path"] == target
+            assert conflict["reason"] == "target_republished_same_content"
+            assert conflict["actual_revision_no"] == 1
+            assert conflict["baseline_revision_no"] is None
+
+            nos = await conn_put.fetch(
+                "SELECT revision_no FROM revisions WHERE object_path = $1"
+                " ORDER BY revision_no",
+                target,
+            )
+            assert [r["revision_no"] for r in nos] == [1]  # no duplicate rev 1
+        finally:
+            await conn_put.close()
+            await conn_ack.close()
+
+    asyncio.run(scenario())
+
+
+def test_ack_before_first_put_put_waits_and_continues_revision_no(client):
+    """Deterministic ack-first interleave: the acknowledgement holds the
+    placeholder FOR UPDATE lock when the first PUT arrives.  The PUT must
+    wait (no deadlock) and, once the ack commits rev 1, publish rev 2 --
+    not collide on revision 1."""
+    import asyncio
+    import asyncpg
+    import os
+
+    from app import db
+
+    sid, _cursor, target = _open_session_for_missing_target(client)
+
+    async def scenario():
+        conn_put = await asyncpg.connect(os.environ["DATABASE_URL"])
+        conn_ack = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            # ACK locks the target set first and applies rev 1 (uncommitted).
+            t_ack = conn_ack.transaction()
+            await t_ack.start()
+            entries = await db.fetch_segment_entries(conn_ack, sid, 0)
+            baselines = await db.fetch_segment_baselines(conn_ack, sid, 0)
+            current = await db.lock_target_objects(conn_ack, [target])
+            applied, conflicts = await db.apply_copy_entries(
+                conn_ack, entries, baselines, current
+            )
+            assert conflicts == []
+            assert applied[0]["action"] == "created"
+            assert applied[0]["revision_no"] == 1
+
+            # PUT arrives while the ack holds the lock.
+            async def put():
+                t_put = conn_put.transaction()
+                await t_put.start()
+                # Blocks until the ack commits; then rev 1 is visible.
+                rev = await db.lock_new_or_existing_object(conn_put, target)
+                assert rev is not None and rev.revision_no == 1
+                _, revision_no, _ = await db.publish_revision(
+                    conn_put, target, b"other-bytes", "text/plain"
+                )
+                await t_put.commit()
+                return revision_no
+
+            put_task = asyncio.create_task(put())
+            await asyncio.sleep(1.0)
+            assert not put_task.done()  # blocked behind the ack, not deadlocked
+            await t_ack.commit()
+            revision_no = await asyncio.wait_for(put_task, timeout=10)
+            assert revision_no == 2  # continues the sequence
+
+            nos = await conn_put.fetch(
+                "SELECT revision_no FROM revisions WHERE object_path = $1"
+                " ORDER BY revision_no",
+                target,
+            )
+            assert [r["revision_no"] for r in nos] == [1, 2]
+        finally:
+            await conn_put.close()
+            await conn_ack.close()
+
+    asyncio.run(scenario())
+
+    # The PUT's revision 2 is now current; the session cursor never moved.
+    g = client.get(f"/objects/{target}")
+    assert g.content == b"other-bytes"
+    assert client.get(f"/copy-sessions/{sid}").json()["next_segment"] == 0
+
+
+def test_ack_and_first_put_interleave_over_http_never_500(client):
+    """End-to-end barrier race, repeated to hit both interleavings:
+    a first PUT to a placeholder and the segment ack release together.
+
+    * PUT first  -> ack 409 with the conflicting object + resume position,
+      whole batch rolled back, cursor not advanced; replay is identical;
+    * ack first  -> ack 200 (creates rev 1), the PUT waits and lands rev 2.
+
+    Neither outcome may ever be a 500 or a duplicated revision number.
+    """
+    import threading
+
+    for i in range(8):
+        prefix = _prefix(f"race-http-{i}")
+        paths = _put_sources(client, prefix, {"a.txt": b"same-bytes"})
+        target = f"backup/{prefix}/a.txt"
+        sid = _create_session(
+            client, paths, "backup/", segment_size=1
+        ).json()["session"]
+        cursor = _pull(client, sid).json()["cursor"]
+        barrier = threading.Barrier(2)
+        outcomes = {}
+
+        def do_put():
+            barrier.wait()
+            outcomes["put"] = client.put(
+                f"/objects/{target}",
+                content=b"same-bytes",
+                headers={"Content-Type": "text/plain"},
+            )
+
+        def do_ack():
+            barrier.wait()
+            outcomes["ack"] = _ack(client, sid, cursor)
+
+        threads = [threading.Thread(target=do_put), threading.Thread(target=do_ack)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        put_r, ack_r = outcomes["put"], outcomes["ack"]
+        assert put_r.status_code == 204
+        assert ack_r.status_code in (200, 409)
+
+        if ack_r.status_code == 409:
+            # PUT published first: structured conflict, batch rolled back.
+            result = ack_r.json()
+            assert result["status"] == "conflict"
+            assert result["applied"] == []
+            conflict = result["conflicts"][0]
+            assert conflict["target_path"] == target
+            assert conflict["reason"] == "target_republished_same_content"
+            assert conflict["actual_revision_no"] == 1
+            assert conflict["baseline_revision_no"] is None
+            assert result["resume"] == {
+                "next_segment": 0,
+                "last_confirmed_cursor": None,
+            }
+            assert put_r.headers["x-revision-no"] == "1"
+            # Cursor unchanged and the result replays verbatim.
+            assert client.get(f"/copy-sessions/{sid}").json()["next_segment"] == 0
+            assert _ack(client, sid, cursor).content == ack_r.content
+        else:
+            # ACK won the lock: it created rev 1; the waiting PUT is rev 2.
+            applied = ack_r.json()["applied"]
+            assert len(applied) == 1
+            assert applied[0]["action"] == "created"
+            assert applied[0]["revision_no"] == 1
+            assert put_r.headers["x-revision-no"] == "2"
+            assert ack_r.json()["resume"]["next_segment"] == 1
+
+        # Target content is the published bytes either way; exactly one
+        # revision per number ever existed.
+        assert client.get(f"/objects/{target}").content == b"same-bytes"
+
+
 # ---- resume across sessions ------------------------------------------------------
 
 def test_resume_with_last_confirmed_cursor(client):
